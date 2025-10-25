@@ -1,0 +1,488 @@
+using System.Collections;
+using System.Collections.Generic;
+using UnityEngine;
+using UnityEngine.InputSystem;
+using UnityEngine.SceneManagement;
+
+public class PlayerMovement : MonoBehaviour
+{
+    [Header("Movement Settings")]
+    [SerializeField] float normalSpeed = 5f;
+    [SerializeField] float underwaterSpeed = 2f;
+
+    [Header("Gravity Settings")]
+    [SerializeField] float normalGravity = 1.5f;
+    [SerializeField] float underwaterGravity = 0.3f;
+
+    [Header("Jump Settings")]
+    [SerializeField] float jumpSpeed = 8f;
+    [SerializeField] float underwaterJumpSpeed = 4f;
+
+    [Header("Climbing Settings")]
+    [SerializeField] float climbSpeed = 3f;
+    [SerializeField] float climbAnimSpeed = 0.4f;
+
+    [Header("Ground Check")]
+    [SerializeField] Transform groundCheck;
+    [SerializeField] float groundCheckRadius = 0.05f;
+    [SerializeField] LayerMask groundLayer;
+
+    [Header("Death Settings")]
+    [SerializeField] Vector2 deathKick = new Vector2(10f, 10f);
+    [SerializeField] Vector2 drownKick = new Vector2(1f, 1f);
+    [SerializeField] PhysicsMaterial2D deathFrictionMaterial;
+    [SerializeField] Vector2 deathColliderSize = new Vector2(1.5f, 0.5f);
+
+    [Header("Underwater Breath")]
+    [SerializeField] float maxBreathTime = 5f;
+
+    [Header("Laser Eyes")]
+    [SerializeField] GameObject laser;
+    [SerializeField] Transform laserEyes;
+
+    [Header("Power-Up Animations")]
+    [SerializeField] private Animator playerAnimator;
+    [SerializeField] private RuntimeAnimatorController baseController;
+    [SerializeField] private RuntimeAnimatorController snorkelController;
+    [SerializeField] private RuntimeAnimatorController snorkelShoesController;
+    [SerializeField] private RuntimeAnimatorController fullyPoweredController;
+
+    [Header("Power-Up Stats")]
+    [SerializeField] private float jumpMultiplier = 1f;
+    [SerializeField] private float laserCooldown = 0.3f;
+
+    [Header("UI References")]
+    [SerializeField] private UnityEngine.UI.Slider breathSlider;
+    [SerializeField] private TMPro.TextMeshProUGUI oxygenLabel;
+    [SerializeField] private TMPro.TextMeshProUGUI winText;
+
+
+
+    [Header("SFX")]
+    [SerializeField] private AudioClip jumpSFX;
+    [SerializeField] private AudioClip powerupSFX;
+    [SerializeField] private AudioClip shootSFX;
+    [SerializeField] private AudioSource audioSource;
+
+    [Header("FX")]
+    [SerializeField] private GameObject splashEffectPrefab;
+
+
+    private Rigidbody2D myRigidbody;
+    private Animator myAnimator;
+    private BoxCollider2D myBoxCollider;
+    private Vector2 moveInput;
+    private Transform originalParent;
+
+    private float currentSpeed;
+    private bool isUnderwater = false;
+    private bool isAlive = true;
+    private bool isClimbing = false;
+    private float gravityScaleAtStart;
+    private float currentBreathTime;
+    private bool mouthUnderwater = false;
+    private bool hasSnorkel = false;
+    private bool hasShoes = false;
+    private bool hasPotion = false;
+    private bool hasInfiniteBreath = false;
+    private float lastFireTime = 0f;
+    private int facingDirection = 1; // 1 = right, -1 = left
+
+
+
+    void Start()
+    {
+        myRigidbody = GetComponent<Rigidbody2D>();
+        myAnimator = GetComponent<Animator>();
+        myBoxCollider = GetComponent<BoxCollider2D>();
+        gravityScaleAtStart = myRigidbody.gravityScale;
+        currentSpeed = normalSpeed;
+        myRigidbody.gravityScale = normalGravity;
+        currentBreathTime = maxBreathTime;
+    }
+
+    void Update()
+    {
+        if (!isAlive) return;
+        ClimbLadder();
+        HandleJumpAnimation();
+        Run();
+        FlipSprite();
+        Die();
+        HandleBreath();
+    }
+
+    public void SetUnderwater(bool underwater)
+    {
+        if (isUnderwater == underwater) return; // no change, avoids repeats
+
+        isUnderwater = underwater;
+        currentSpeed = underwater ? underwaterSpeed : normalSpeed;
+        UpdateGravity();
+
+        Debug.Log($"Underwater set to {underwater}. Gravity: {myRigidbody.gravityScale}, Speed: {currentSpeed}");
+    }
+
+
+
+    public void SetMouthUnderwater(bool underwater)
+    {
+        mouthUnderwater = underwater;
+        if (!mouthUnderwater)
+        {
+            currentBreathTime = maxBreathTime; // reset when mouth leaves water
+        }
+
+        Debug.Log($"Mouth underwater: {underwater}");
+    }
+
+    private void UpdateGravity()
+    {
+        // If climbing, gravity is zero regardless
+        float newGravity = isClimbing ? 0f : (isUnderwater ? underwaterGravity : normalGravity);
+
+        if (Mathf.Abs(myRigidbody.gravityScale - newGravity) > 0.01f)
+        {
+            myRigidbody.gravityScale = newGravity;
+            Debug.Log($"Gravity changed to {newGravity}");
+        }
+    }
+
+    private void HandleBreath()
+    {
+        if (!isAlive) return;
+
+        if (mouthUnderwater)
+        {
+            if (!hasInfiniteBreath) // only decrease if no snorkel
+            {
+                currentBreathTime -= Time.deltaTime;
+
+                if (currentBreathTime <= 0f)
+                {
+                    currentBreathTime = 0f;
+                    Drown();
+                }
+            }
+            else
+            {
+                currentBreathTime = maxBreathTime; // optional: keep it max
+            }
+        }
+        else
+        {
+            // Slowly refill breath if not underwater
+            currentBreathTime = Mathf.Min(currentBreathTime + Time.deltaTime, maxBreathTime);
+        }
+        UpdateBreathUI();
+        Debug.Log($"Breath: {currentBreathTime:F2}/{maxBreathTime}");
+    }
+
+
+    //Button Presses Move, Jump, Fire
+    void OnMove(InputValue value)
+    {
+        if (!isAlive) return;
+
+        moveInput = value.Get<Vector2>();
+    }
+
+    void OnJump(InputValue value)
+    {
+        if (!isAlive) return;
+
+        bool isGrounded = Physics2D.OverlapCircle(groundCheck.position, groundCheckRadius, groundLayer);
+        if (!isGrounded) return;
+
+        if (value.isPressed)
+        {
+            // float jumpVelocity = isUnderwater ? underwaterJumpSpeed : jumpSpeed;
+            // myRigidbody.velocity = new Vector2(myRigidbody.velocity.x, jumpVelocity);
+
+            float jumpVelocity = (isUnderwater ? underwaterJumpSpeed : jumpSpeed) * jumpMultiplier;
+            myRigidbody.velocity = new Vector2(myRigidbody.velocity.x, jumpVelocity);
+
+            if (audioSource != null && jumpSFX != null)
+            {
+                audioSource.PlayOneShot(jumpSFX);   
+            }
+
+
+        }
+    }
+
+    private void OnFire(InputValue value)
+    {
+        if (!isAlive || !hasPotion) return;
+
+        if (Time.time - lastFireTime < laserCooldown) return;
+
+        Instantiate(laser, laserEyes.position, transform.rotation);
+        lastFireTime = Time.time;
+
+        if (audioSource != null && shootSFX != null)
+        {
+            audioSource.PlayOneShot(shootSFX);    
+        }
+
+    }
+
+
+    void HandleJumpAnimation()
+    {
+        bool isGrounded = Physics2D.OverlapCircle(groundCheck.position, groundCheckRadius, groundLayer);
+        myAnimator.SetBool("isJumping", !isGrounded);
+    }
+
+
+    void Run()
+    {
+        float horizontalInput = moveInput.x * currentSpeed;
+
+        Vector2 velocity = new Vector2(horizontalInput, myRigidbody.velocity.y);
+
+        // Preserve vertical velocity if climbing
+        if (isClimbing)
+            velocity.y = myRigidbody.velocity.y;
+
+        myRigidbody.velocity = velocity;
+
+        // Run animation only if player is pressing input
+        bool isGrounded = Physics2D.OverlapCircle(groundCheck.position, groundCheckRadius, groundLayer);
+        bool playerHasInput = Mathf.Abs(moveInput.x) > Mathf.Epsilon;
+        myAnimator.SetBool("isRunning", playerHasInput && isGrounded && !isClimbing);
+    }
+
+
+
+
+
+
+    void FlipSprite()
+    {
+        if (isClimbing)
+        {
+            // Lock scale while on ladder
+            transform.localScale = new Vector2(1f, 1f); // always facing right
+            return;
+        }
+
+        if (Mathf.Abs(myRigidbody.velocity.x) > Mathf.Epsilon)
+        {
+            facingDirection = (int)Mathf.Sign(myRigidbody.velocity.x);
+            transform.localScale = new Vector2(facingDirection, 1f);
+        }
+    }
+
+
+
+
+
+    void ClimbLadder()
+    {
+        bool touchingClimbing = myBoxCollider.IsTouchingLayers(LayerMask.GetMask("Climbing"));
+
+        if (!touchingClimbing)
+        {
+            if (isClimbing)
+            {
+                isClimbing = false;
+                UpdateGravity();  // reset gravity
+                myAnimator.SetBool("isClimbing", false);
+                myAnimator.SetFloat("climbSpeed", 1f);
+            }
+            return;
+        }
+
+        if (!isClimbing)
+        {
+            isClimbing = true;
+            UpdateGravity();  // gravity zero while climbing
+        }
+
+        float verticalInput = moveInput.y;
+
+        float rayLength = 0.05f;
+        Vector2 headPosition = (Vector2)myBoxCollider.bounds.center + Vector2.up * myBoxCollider.bounds.extents.y;
+        Vector2 feetPosition = (Vector2)myBoxCollider.bounds.center - Vector2.up * myBoxCollider.bounds.extents.y;
+
+        bool headBlocked = Physics2D.Raycast(headPosition, Vector2.up, rayLength, LayerMask.GetMask("Ground"));
+        bool feetBlocked = Physics2D.Raycast(feetPosition, Vector2.down, rayLength, LayerMask.GetMask("Ground"));
+
+        if ((verticalInput > 0 && headBlocked) || (verticalInput < 0 && feetBlocked))
+        {
+            verticalInput = 0f;
+        }
+
+        // Vertical velocity only controlled here
+        Vector2 climbVelocity = new Vector2(myRigidbody.velocity.x, verticalInput * climbSpeed);
+        myRigidbody.velocity = climbVelocity;
+
+        myAnimator.SetBool("isClimbing", true);
+
+        bool isTryingToMove = Mathf.Abs(moveInput.y) > Mathf.Epsilon;
+        bool isBlocked = (moveInput.y > 0 && headBlocked) || (moveInput.y < 0 && feetBlocked);
+        myAnimator.SetFloat("climbSpeed", (!isTryingToMove || isBlocked) ? 0f : climbAnimSpeed);
+    }
+
+    // --- Snorkel ---
+    public void SetInfiniteBreath(bool value)
+    {
+        hasSnorkel = value;
+        hasInfiniteBreath = value;
+        UpdateAnimations();
+        if (audioSource != null && powerupSFX != null)
+        {
+            audioSource.PlayOneShot(powerupSFX);     
+        }
+    }
+
+    // --- Shoes ---
+    public void SetJumpMultiplier(float multiplier)
+    {
+        hasShoes = true;
+        jumpMultiplier = multiplier; // multiply normal jump speed in your OnJump
+        UpdateAnimations();
+
+        if (audioSource != null && powerupSFX != null)
+        {
+            audioSource.PlayOneShot(powerupSFX);
+        }
+    }
+
+    // --- Potion / Laser Eyes ---
+    public void EnableLaserEyes(bool value)
+    {
+        hasPotion = value;
+        UpdateAnimations();
+        if (audioSource != null && powerupSFX != null)
+        {
+            audioSource.PlayOneShot(powerupSFX);            
+        }
+    }
+
+    private void UpdateAnimations()
+    {
+        if (hasSnorkel && hasShoes && hasPotion)
+            playerAnimator.runtimeAnimatorController = fullyPoweredController;
+        else if (hasSnorkel && hasShoes)
+            playerAnimator.runtimeAnimatorController = snorkelShoesController;
+        else if (hasSnorkel)
+            playerAnimator.runtimeAnimatorController = snorkelController;
+        else
+            playerAnimator.runtimeAnimatorController = baseController;
+    }
+
+    void Die()
+    {
+        if (myBoxCollider.IsTouchingLayers(LayerMask.GetMask("Enemy", "Hazards")))
+        {
+            isAlive = false;
+            myBoxCollider.size = deathColliderSize;
+            myAnimator.SetTrigger("Dying");
+            myBoxCollider.sharedMaterial = deathFrictionMaterial;
+            myRigidbody.velocity = deathKick;
+            moveInput = Vector2.zero;
+            // Start coroutine to reload scene
+            StartCoroutine(HandleDeath(3f)); // 1 second delay
+        }
+    }
+
+    void Drown()
+    {
+        if (!isAlive) return;
+        isAlive = false;
+        isClimbing = false;              // force off ladder logic
+        myBoxCollider.size = deathColliderSize;
+        myRigidbody.gravityScale = normalGravity; // restore gravity
+        myAnimator.SetTrigger("Dying");  // can create a separate drowning animation later
+        myBoxCollider.sharedMaterial = deathFrictionMaterial;
+        myRigidbody.velocity = drownKick;
+        moveInput = Vector2.zero;
+        Debug.Log("Player drowned!");
+        // Start coroutine to reload scene
+        StartCoroutine(HandleDeath(3f)); // 1 second delay
+    }
+
+    private IEnumerator HandleDeath(float delay)
+    {
+        // Wait for the delay (to allow death animation, kick, etc.)
+        yield return new WaitForSeconds(delay);
+
+        // Reload the current scene
+        SceneManager.LoadScene(SceneManager.GetActiveScene().name);
+    }
+
+    private void OnCollisionEnter2D(Collision2D collision)
+    {
+        if (collision.gameObject.CompareTag("MovingPlatform"))
+        {
+            if (collision.transform == transform.parent) return; // already parented
+            originalParent = transform.parent;
+            transform.parent = collision.transform; // stick to platform
+        }
+    }
+
+    private void OnCollisionExit2D(Collision2D collision)
+    {
+        if (collision.gameObject.CompareTag("MovingPlatform"))
+        {
+            transform.parent = originalParent; // restore original parent
+        }
+    }
+
+private void UpdateBreathUI()
+{
+    if (breathSlider == null) return;
+
+    // Show slider only when underwater
+    breathSlider.gameObject.SetActive(isUnderwater);
+
+    if (!isUnderwater) return;
+
+    // Normalize breath between 0–1
+    float normalizedBreath = currentBreathTime / maxBreathTime;
+    breathSlider.value = normalizedBreath;
+}
+
+
+    public void Win()
+    {
+        if (!isAlive) return; // prevent overlapping death logic
+        isAlive = false;
+        moveInput = Vector2.zero;
+        myRigidbody.velocity = Vector2.zero;
+
+        if (winText != null)
+            winText.gameObject.SetActive(true);
+
+        Debug.Log("Player won the level!");
+
+        // restart after 5 seconds
+        StartCoroutine(HandleWin(5f));
+    }
+
+    private IEnumerator HandleWin(float delay)
+    {
+        yield return new WaitForSeconds(delay);
+        SceneManager.LoadScene(SceneManager.GetActiveScene().name);
+    }
+
+    private void OnTriggerEnter2D(Collider2D collision)
+    {
+        if (collision.CompareTag("Water"))
+        {
+            // Spawn splash once when hitting water surface
+            if (splashEffectPrefab != null)
+            {
+                Instantiate(
+                    splashEffectPrefab,
+                    new Vector3(transform.position.x, collision.bounds.max.y, 0f), 
+                    Quaternion.identity
+                );
+            }
+        }
+    }
+
+
+}
